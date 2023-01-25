@@ -28,7 +28,7 @@ All functions for data processing and model fitting are found within the `functi
 
 #### Data processing functions
 - *"sim_controls.R"*: function to simulate control locations from either a uniform spatial distribution or a gamma distribution of step lengths
--*"get_step_and_angle.R"*: function to calculate the step length and turning angle from each case location to the next case and all corresponding controls
+- *"get_step_and_angle.R"*: function to calculate the step length and turning angle from each case location to the next case and all corresponding controls
 
 #### other functions
 - *"beta_to_mean.R"*: calculates the mean/sd of gamma distribution from estimated betas
@@ -39,7 +39,7 @@ All functions for data processing and model fitting are found within the `functi
 ### Zebra example scripts
 The folder `illustration.R` includes the code needed to reproduce the zebra example. This includes the following scripts:
 
--*"1_zebra_data_processing.R"*: script to process the zebra data (generating control locations, obtaining covariates, etc.)
+- *"1_zebra_data_processing.R"*: script to process the zebra data (generating control locations, obtaining covariates, etc.)
 - *"2_initial_par.R"*: script to set multiple sets of initial values (and save as `initial_par.RData`)
 - *"3_zebra_fit.R"*: script to fit the model to the zebra data (using all sets of starting parameters and picking the best fitted model, and saving as `best_fit.RData`
 - *"plot_hb.R"*: plot the movement data and habitat raster
