@@ -40,7 +40,7 @@ All functions for data processing and model fitting are found within the `functi
 The folder `illustration.R` includes the code needed to reproduce the zebra example. This includes the following scripts:
 
 -*"1_zebra_data_processing.R"*: script to process the zebra data (generating control locations, obtaining covariates, etc.)
--*"2_initial_par.R"*: script to set multiple sets of initial values (and save as `initial_par.RData`)
+- *"2_initial_par.R"*: script to set multiple sets of initial values (and save as `initial_par.RData`)
 - *"3_zebra_fit.R"*: script to fit the model to the zebra data (using all sets of starting parameters and picking the best fitted model, and saving as `best_fit.RData`
 - *"plot_hb.R"*: plot the movement data and habitat raster
 - *"zebra_plot_decode.R"*: plot the viterbi sequence and local state probabilities
