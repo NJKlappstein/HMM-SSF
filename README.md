@@ -8,7 +8,7 @@ Working directory note: All scripts were written with the root directory of the 
 This repository contains the code to reproduce the illustrative example of Klappstein et al. ([https://doi.org/10.1101/2022.11.30.518554](https://doi.org/10.1101/2022.11.30.518554)). This README describes 3 folders (`code`, `data`, and `documents`). Note, this repo is a work-in-progress and will be updated periodically.
 
 ## Code folder
-There are 2 main folders within the code folder. The main functions for data processing and model fitting are found in `functions`. Code to fit the HMM-SSF to the zebra data is found `illustration`, and this folder includes all code to produce the plots in the manuscript. There are also two RMarkdown files that describe the steps of the data processing (`HMM-SSF_data.Rmd`) and model fitting/plotting/interpretation (`HMM-SSF_fitting.Rmd`). 
+There are 2 main folders within the code folder. The main functions for data processing and model fitting are found in `functions`. Code to fit the HMM-SSF to the zebra data is found `illustration`, and this folder includes all code to produce the plots in the manuscript. There are also two RMarkdown files found in `documents` that describe the steps of the data processing (`HMM-SSF_data.Rmd`) and model fitting/plotting/interpretation (`HMM-SSF_fitting.Rmd`). 
 
 ### HMM-SSF functions
 All functions for data processing and model fitting are found within the `functions` folder. 

@@ -1,0 +1,439 @@
+---
+title: "HMM-SSF example (part 2: fitting)"
+author: "Natasha Klappstein"
+date: "2023-01-16"
+output: 
+  pdf_document:
+    number_sections: true
+    toc: true
+---
+
+```{r setup, echo = FALSE}
+# set wd for all subsequent code chunks to project directory
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+```{r, echo = FALSE, message=FALSE}
+# track needed functions/packages
+library(raster)
+library(dplyr)
+library(CircStats)
+
+# fitting functions
+source("code/functions/fitHMMSSF.R") # main fitting function
+source("code/functions/nllk.R") # negative log-likelihoof
+source("code/functions/hessian_CI.R") # function to get parameter CIs from the hessian
+source("code/functions/sampling_dens.R") # get correction for control density in llk
+source("code/functions/format_par.R") # used to format vector of par (needed for optim) to matrix form
+library(Rcpp)
+sourceCpp("code/functions/state_dens_Rcpp.cpp") # calculate state-dependent densities
+
+# plotting/output functions
+source("code/functions/plot_step_angle.R") # this needs the following:
+source("code/functions/get_shape_scale.R")
+source("code/functions/beta_to_mean.R")
+source("code/functions/predict_tpm.R")
+source("code/functions/predict_delta.R")
+
+#decoding
+source("code/functions/viterbi_decoding.R")
+source("code/functions/local_decoding.R")
+
+theme_set(theme_light(13))
+```
+
+# Introduction
+This document shows a worked example of fitting HMM-SSF (to reproduce the analysis in the manuscript, "Flexible hidden Markov models for behaviour-dependent habitat selection", Klappstein et al. ([https://doi.org/10.1101/2022.11.30.518554](https://doi.org/10.1101/2022.11.30.518554)) or the file `HMM_SSF_bioRxiv.pdf`). Note, thaty this is a work-in-progress and most sections have incomplete details, and has not yet been thoroughly checked for errors, typos, etc. See the manuscript for further information and mathematical details of the model. Here, we start from a processed dataset with control locations and covariates; in this case, we are using the zebra example from the previous example and the manuscrupt. The dataset consists of half-hourly locations with step lengths, turning angles, vegetation/habitat type (grassland, bushed grassland, bushland, woodland), and time of day as covariates. We generated control locations with uniform turning angles and gamma-distributed step lengths (with parameters derived from the observed data). 
+```{r} 
+data <- readRDS("data/zebra_processed.RData")
+names(data)
+```
+
+```{r, echo = FALSE, warning = FALSE, fig.width=5, fig.height=5, fig.align='center'}
+# observed locations
+obs <- subset(data, obs == 1)
+
+# load habitat raster and format for plot
+hb <- raster("data/vegetation2.grd")
+hb_pal <- c("#9BA6A0", "#5F7A6B", "#365543", "#1C332D")
+lab <- c("grassland", "bushed\ngrassland", "bushland", "woodland")
+covmap <- data.frame(coordinates(hb), val = values(hb))
+
+ggplot(covmap, aes(x, y)) + 
+  geom_raster(aes(fill = factor(val))) +
+  coord_equal() + 
+  xlab("Easting (km)") + 
+  ylab("Northing (km)") +
+  scale_fill_manual(values = hb_pal, name = NULL, labels = lab) +
+  geom_path(aes(x, y), obs, size = 0.35, color = "burlywood1", alpha = 0.6) +
+  geom_point(aes(x, y), obs, size = 0.2, color = "burlywood1", alpha = 0.6) +
+  theme(legend.key.size = unit(1.4, "lines")) +
+  scale_x_continuous(expand = c(0, 0)) +
+  scale_y_continuous(expand = c(0, 0))
+
+```
+
+
+# Model formulation
+We want to fit a two-state HMM-SSF, with both habitat selection (i.e., SSF) covariates, and covariates on the HMM transition probabilities. We explain the covariates in the next sections, and the model formulas can be specified in `R` as follows:
+
+```{r}
+n_states <- 2
+ssf_formula <- ~ step + log(step) + cos(angle) + veg
+tpm_formula <- ~ cos(2*pi*tod/24) + sin(2*pi*tod/24)
+```
+
+## SSF covariates 
+We model habitat selection based on habitat (i.e., vegetation type) and movement (i.e., steps and turns). We choose to model steps with a gamma distribution, and this can be accomplished by including step length and its log as covariates in the SSF. The von Mises is a circular distribution, naturally used for turning angles, and we include the cosine of the angle in the SSF. We include vegetation types as a categorical covariate with four levels: i) grassland (the reference category), ii) bushed grassland, iii) bushland, and iv) woodland. The habitat selection model for a step ending at $y$ given that it started at $x$ then takes the form, 
+\begin{equation} 
+f(y|x) \propto \exp\{\beta_1 L + \beta_2 \log(L)  + \beta_3 \cos(\theta) + \beta_4 \delta^{b\_grass} + \beta_5 \delta^{bush} + \beta_6 \delta^{wood} \}
+\end{equation}
+where $L$ is the step length, $\theta$ is turning angle, and $\delta$ is an indicator variable for the categorical vegetation type variable (0 or 1). 
+
+## Transition probability (HMM) covariates
+We model transition probabilities based on time of day. We include a cyclic covariate, such that
+\begin{equation}
+\eta_{ij}^{(t)} = \begin{cases}
+\alpha^{(ij)}_0 + \alpha_1^{(ij)} \cos \left(\frac{2 \pi \tau_t}{24}\right) +  \alpha_2^{(ij)} \sin \left(\frac{2 \pi \tau_t}{24}\right) & \text{if } i \neq j \\
+0 & \text{otherwise} 
+\end{cases} .
+\end{equation}
+
+# Model fitting
+
+## Initialisation
+We use direct numerical optimisation of the likelihood via the forward algorithm for model fitting. This requires selecting initial parameter values for the optimiser.  In general, for our functions, the initial SSF parameters for a model with $K$ states and $p$ covariates take the form,
+
+\begin{equation}
+\boldsymbol{\beta} = 	\begin{pmatrix}
+\beta_1^{(1)} & \cdots & \beta_1^{(K)} \\ 
+\beta_2^{(1)} & \cdots & \beta_2^{(K)} \\ 
+\vdots & \ddots & \vdots \\  
+\beta_p^{(1)} & \cdots & \beta_p^{(K)} \\
+\end{pmatrix} 
+\end{equation}
+
+Similarly, the parameters for the transition probability matrix will have a row for each model term (intercept and all covariates), and include each transition. For example, in a 3-state model with $p$ covariates, they take the form,
+\begin{equation}
+\boldsymbol{\alpha} = 	\begin{pmatrix}
+\alpha_0^{(12)} & \alpha_0^{(13)} & \alpha_0^{(21)}  & \alpha_0^{(23)} & \alpha_0^{(31)} & \alpha_0^{(32)} \\
+\alpha_1^{(12)} & \alpha_1^{(13)} & \alpha_1^{(21)}  & \alpha_1^{(23)} & \alpha_1^{(31)} & \alpha_1^{(32)}  \\
+\vdots & \vdots & \vdots & \vdots & \vdots & \vdots \\
+\alpha_p^{(12)} & \alpha_p^{(13)} & \alpha_p^{(21)}  & \alpha_p^{(23)} & \alpha_p^{(31)} & \alpha_p^{(32)}  \\
+\end{pmatrix} 
+\end{equation}
+
+The initial parameters must be carefully chosen to ensure we find the global minima (rather than local) of the likelihood function. This can be challenging, and it is common to try a range of starting values, ultimately selecting the fitted model with the lowest negative log likelihood. We don't show this in detail here, but in practice, we tried multiple starting values: movement initial values based on a fitted HMM, paired with several different habitat selection initial values. The `illustration` folder of this repository has the full code to do so: `initial_par.R` defines the sets of initial values, and `zebra_fit.R` fits the model with all sets and selects the best model. Here, we just load the initial parameters and only fit the model with the best set: 
+```{r}
+initial_par <- readRDS("code/illustration/initial_par.RData")
+initial_par <- initial_par[[3]]
+initial_par
+```
+Note, the initial parameters are stored in a list with matrices for the $\beta$ (i.e., SSF) and $\alpha$ (i.e., HMM) parameters in the form specified above (but note the change in dimension of $\boldsymbol{\alpha}$). 
+
+## Calling the optimisation function
+
+We use a custom fitting function `fitHMMSSF`, which calls the `R` function `optim`. `fitHMMSSF` takes the following arguments:
+
+- `ssf_formula`: habitat selection model formula in the form `~step_covariates + cos(angle) + habitat_covariates`
+- `tpm_formula`: transition probability model (set to `~1` if no covariates)
+- `data`: data processed with control locations and all necessary covariates
+- `par0`: initial parameters, in a list form with matrices called `betas` and `alphas`
+- `n_states`: how many states in the HMM
+- `dist`: control step length distribution (gamma or uniform)
+
+```{r, eval = FALSE}
+fit <- fitHMMSSF(ssf_formula = ssf_formula, 
+                 tpm_formula = tpm_formula,
+                 data = data, 
+                 par0 = initial_par, 
+                 n_states = n_states, 
+                 dist = "gamma", 
+                 optim_opts = list(trace = 1,
+                                   maxit = 1e4))
+```
+```{r, echo = FALSE}
+fit <- readRDS("code/illustration/best_fit.RData")
+```
+In this case, the model properly converged in 7161 optimisation iterations. The fitted model parameters are returned (with 95% confidence intervals) in a list with the following elements: 
+
+- `betas`: estimated habitat (i.e., SSF) coeffcients with 95% CIs (`lower' and `upper`), returned with named covariates and states
+- `alphas`: estimated transition probability covariates with 95% CIs (`lower' and `upper`), returned with named covariates and transitions
+- `convergence`: convergence code returned from `optim` (0 indicates successful convergence, but see `optim` documentation for all codes)
+- `nllk`: the negative log-likelihood
+- `hessian`: the estimated Hessian matrix returned from `optim`
+
+The fitted mode outputs take the following forms:
+```{r}
+fit$betas
+fit$alphas
+fit$convergence
+fit$nllk
+```
+
+# Inference
+
+The estimated model parameters tell us about habitat selection and movement patterns, as well as behavioural state dynamics. We start by explaining state decoding (i.e., state classification) and then interpret the SSF and HMM covariates.
+
+
+
+## State decoding
+State decoding is useful to understand the most likely states along the time series. There are two types of state decoding: global (estimated with the Viterbi algorithm) and local (estimated with the forward-backward algorithm). Global decoding focuses on the most likely state sequence, whereas local decoding derives the local state probability for each observation. The outputs are generally quite similar, but not identical, as they solve different optimisation problems. 
+
+To obtain decoded states, we use two custom functions: i) `viterbi_decoding` and ii) `local_decoding`. Both functions require the SSF and transition probability model formulas, the data, the fitted model, and the number of states. Global decoding returns the most likely sequence of states, and local decoding returns the local probabilities of each state. 
+
+```{r}
+# global decoding via the Viterbi algorithm
+viterbi <- viterbi_decoding(ssf_formula = ssf_formula, 
+                            tpm_formula = tpm_formula, 
+                            data = data, 
+                            fit = fit, 
+                            n_states = n_states)
+
+# view output (i.e., state sequence)
+head(viterbi, 100)
+
+# local decoding via the forward-backward algorithm
+sp <- local_decoding(ssf_formula = ssf_formula, 
+                     tpm_formula = tpm_formula, 
+                     data = data, 
+                     fit = fit, 
+                     n_states = n_states)
+
+# view output (i.e., local probabilities of each state)
+head(sp)
+
+```
+We can see how these two outputs compare (for a subset of the time series for visualation purposes). Note, here we are plotting both on the same graph, but they have distinct axes. The Viterbi sequence takes values of 1 or 2, while the local state probabilities are between (0,1).
+
+```{r, echo = FALSE, fig.width=9, fig.height=3}
+# add estimated state sequence to observed locs
+obs$global <- paste0("state ", viterbi)
+obs$global_name <- ifelse(obs$global == "state 1", "encamped", "exploratory")
+obs$global_num <- ifelse(obs$global == "state 1", 1, 2)
+obs$sp2 <- sp[,2] # local probability of being in state 2
+
+# plot comparison of viterbi and sp
+ggplot(obs[100:250,], aes(time, sp2)) +
+  geom_point(aes(y = global_num - 1), color = "grey65") +
+  geom_line(aes(y = global_num - 1), color = "grey65") +
+  geom_line(color = "black") +
+  xlab("") +
+  scale_y_continuous(
+    breaks = c(0, 0.5, 1),
+    expression(Pr(S[t] == 2)), 
+    sec.axis = sec_axis(~ . + 1, name = "Viterbi state", breaks = c(1, 2))) +
+  theme(axis.title.y.right = element_text(colour = "grey65"), 
+        axis.title.y.left = element_text(color = "black"))
+```
+
+The outputs generally agree, and there are very few locations where the outputs predict a differnt state. In general, the local state probabilities give more information about the uncertainty in state classification, whereas the Viterbi sequence only gives the estimated state.
+
+### Spatial visualisation of decoded states
+
+We can visual the decoded states spatially, by subsetting the observations by the states of the Viterbi sequence and plotting them separately:
+
+```{r, echo = FALSE, fig.width=8, fig.height=3.5, warning = FALSE, fig.align='center'}
+# color palette for points
+pal_states <- c("#0072B2", "#D55E00")
+
+ggplot(covmap, aes(x, y)) + 
+  geom_raster(aes(fill = factor(val)), alpha = 0.6) +
+  coord_equal() + 
+  labs(x = "Easting (km)", y = "Northing (km)") +
+  scale_fill_manual(values = hb_pal, guide = "none") +
+  geom_point(data = obs, aes(color = global),
+             size = 0.8, alpha = 0.6) +
+  scale_color_manual(values = pal_states, guide = "none") +
+  facet_wrap("global_name") +
+  scale_x_continuous(expand = c(0, 0)) +
+  scale_y_continuous(expand = c(0, 0)) +
+  theme(strip.background = element_blank(), 
+        strip.text = element_text(colour = "black", size = 11))
+```
+
+Similarly, we can obtain a plot of the local state probabilities by plotting the observations, coloured by the probability (could be in either state 1 or 2; here we plot for state 2):
+
+```{r, echo = FALSE, fig.width=4.5, fig.height=4.5, warning = FALSE, fig.align='center'}
+ggplot(covmap, aes(x, y)) + 
+  geom_raster(aes(fill = factor(val)), alpha = 0.6) +
+  coord_equal() + 
+  labs(x = "Easting (km)", y = "Northing (km)") +
+  scale_fill_manual(values = hb_pal, guide = "none") +
+  scale_color_gradient(low = pal_states[1], high = pal_states[2], 
+                       name = expression(Pr(S[t] == 2))) +
+  geom_point(aes(col = sp2), data = obs, size = 0.8, alpha = 0.5) +
+  theme(legend.key.size = unit(1.2, "lines")) +
+  scale_x_continuous(expand = c(0, 0)) +
+  scale_y_continuous(expand = c(0, 0))
+```
+
+
+## SSF parameters
+The estimate SSF parameters tell us about habitat selection and movement patterns. 
+
+### Movement estimates
+From the fitted model, we can estimate the distributions of steps and turns, but the raw parameter estimates cannot easily be interpreted.
+
+```{r}
+fit$betas[which(fit$betas$cov == "step" |
+                  fit$betas$cov == "log(step)" | 
+                  fit$betas$cov == "cos(angle)"),]
+```
+
+Remember, we fitted the model assuming that steps followed a gamma distribution, and we can derive the distribution parameters from the estimated $\beta_1$ and $\beta_2$ for each state. We can derive the shape $a$ and scale $b$ paramters from the following relationships: $\beta_1 = - 1 / b$ and $\beta_2 = a - 2$. The gamma distribution can also be parameterised in terms of its mean $\mu$ and standard deviation $\sigma$, which is more interpretable. We do so via the following,
+\begin{equation}
+	\mu = - \frac{\beta_2 + 2}{\beta_1}\ \ \ \text{and} \ \  \sigma = - \frac{\sqrt{\beta_2 + 2}}{\beta_1}\ .
+      \end{equation}
+      
+These are both implemented with the following functions:
+```{r}
+get_shape_scale(fit, n_states = 2)
+beta_to_mean(fit, n_states = 2)
+```
+
+From this, we can see that the zebra moved faster in state 2. Similarly, we modelled turning angles $\theta$ with a von Mises distribution by including the $\cos(\theta)$ as a covariate. The estimated $\beta_3$ for each state is the angular concentration parameter of the von Mises distribution. The mean can either be 0 (if the parameter is positive) or $\pi$ (if the parameter is negative), which indicate directional persistence or reversion (respectively). 
+
+```{r}
+fit$betas[which(fit$betas$cov == "cos(angle)"),]
+```
+Notice here that $\beta_3^{(1)}$ is negative (although CIs overlap 0) and $\beta_3^{(2)}$ is positive. This indicates that the zebra has a very weak tendency to revert direction in the first, slower state and a stronger tendency to persist in direction when travelling faster in state 2. From here on, we refer to state 1 as "encamped" behaviour and state 2 as "exploratory" behaviour. We can plot the estimate step length and turning distributions for each state. Note, these plots are made by estimating the distributions, weighted by the number of observations estimated to be in each state (via the Viterbi algorithm). The step length axes are both truncated for visualisation purposes. 
+
+```{r, echo = FALSE, warning = FALSE, message=FALSE, fig.width=8, fig.height=3}
+#create list of movement plots
+p_list <- plot_step_angle(fit, 
+                          viterbi, 
+                          data, 
+                          n_states, 
+                          pal = pal_states, 
+                          as_list = TRUE)
+
+# plot step length disitribution
+p_step <- p_list$step + 
+  theme_light(13) + 
+  scale_color_manual("state", values = pal_states, 
+                     labels = c("encamped", "exploratory")) +  
+  theme(legend.position = c(0.7, 0.80), 
+        legend.title = element_blank())
+
+# plot estimated turning angle distribution
+p_angle <- p_list$angle + 
+  theme_light(13) + 
+  theme(legend.position = "none")
+
+# plot habitat estimates with CIs
+
+plot_grid(p_step, p_angle, labels = "auto", nrow = 1)
+```
+
+### Habitat selection estimates
+The remaining SSF parameters represent habitat selection for different vegetation types.
+```{r}
+habitat_coef <- fit$betas[which(fit$betas$cov == "vegbushed grassland" |
+                  fit$betas$cov == "vegbushland" | 
+                  fit$betas$cov == "vegwoodland"),]
+
+habitat_coef
+```
+
+A negative selection coefficient indicates avoidance of that vegetation type (compared to the reference category), and positive coefficients indicate selection for that vegetation type. We can plot these with uncertainty, where the dashed line at 0 indicates no selection. Here, we can see that the zebra selects against all vegetation types (compared to grassland) in both states, with the excption of selection for bushed grassland in the encamped state.
+
+```{r, echo = FALSE, fig.width = 5, fig.height=3, fig.align='center'}
+ssf_df <- data.frame(state = rep(c(1, 2), each = 3), 
+                     covariate = rep(c("bushed \n grassland", 
+                                       "bushland", 
+                                       "woodland"),
+                                     times = 2), 
+                     estimate = c(fit$betas$estimate[c(4:6, 10:12)]), 
+                     upper = c(fit$betas$upper[c(4:6, 10:12)]),
+                     lower = c(fit$betas$lower[c(4:6, 10:12)]))
+
+pd <- position_dodge(0.25)
+ggplot(ssf_df, aes(y = estimate, 
+                   x = covariate, 
+                   group = state, 
+                   color = as.factor(state))) + 
+  geom_point(position = pd, size = 2) + 
+  geom_errorbar(aes(ymin = lower, ymax = upper), 
+                position = pd,
+                size = 0.5,
+                width = 0.15) + 
+  xlab("vegetation type") + 
+  scale_color_manual("state", values = pal_states[c(1:2)], 
+                     labels = c("encamped", "exploratory")) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  theme_light(13) + theme(legend.title = element_blank())
+
+```
+
+Another common way to interpret SSF parameter estimates is in terms of their relative selection strength (RSS). This can be derived as the exponential of the estimate, and this represents how much more likely the zebra is to take a step in each habitat type compared to the reference category grassland. Since nearly all coefficients are negative, we may alternatively be interested to derive the RSS of grassland, which the 1/RSS: 
+```{r}
+habitat_coef$grass_RSS <- 1/exp(habitat_coef$estimate)
+habitat_coef
+```
+## Transition probability parameters
+
+We also want to make inference about the temporal dynamics of the transition probabilities. This section will be finished soon.
+
+```{r, echo = FALSE, warning = FALSE, message=FALSE, fig.width=10, fig.height=5}
+# sequence over all times of day
+new_data <- data.frame(tod = seq(0, 24, length = 100))
+
+# predict transition probabilities based on time of day (with CIs)
+tpm <- predict_tpm(tpm_formula = tpm_formula, 
+                   new_data = new_data, 
+                   fit = fit, 
+                   n_states = 2, 
+                   return_CI = TRUE)
+
+#format for plotting
+df <- as.data.frame.table(tpm$mle)
+colnames(df) <- c("from", "to", "tod", "value")
+df$tod <- rep(new_data$tod, each = 4)
+df$low <- as.data.frame.table(tpm$lower)[,4]
+df$upp <- as.data.frame.table(tpm$upper)[,4]
+df$from <- ifelse(df$from == 1, "encamped", "exploratory")
+df$to <- ifelse(df$to == 1, "encamped", "exploratory")
+df$prob <- paste0(df$from, " - ", df$to)
+
+p1 <- ggplot(subset(df, from != to), aes(tod, value, linetype = prob)) + 
+  geom_ribbon(aes(ymin = low, ymax = upp), alpha = 0.3) +
+  geom_line() +
+  coord_cartesian(ylim = c(0, 1)) +
+  labs(x = "time of day", y = "transition probability") +
+  scale_x_continuous(breaks = seq(0, 24, by = 4)) +
+  scale_y_continuous(breaks = seq(0, 1, by = 0.5), labels = c("0", "0.5", "1")) +
+  theme(legend.title = element_blank(), 
+        legend.position = "bottom",
+        legend.text = element_text(size = 10.25))
+
+# predict stationary state probabilities via the delta method
+delta <- predict_delta(tpm_formula = tpm_formula, 
+                       new_data = new_data, 
+                       fit = fit, 
+                       n_states = 2, 
+                       return_CI = TRUE)
+
+#format for plot
+df <- as.data.frame.table(delta$mle)
+colnames(df) <- c("tod", "state", "value")
+df$tod <- new_data$tod
+df$low <- as.data.frame.table(delta$lower)[,3]
+df$upp <- as.data.frame.table(delta$upper)[,3]
+df$state <- ifelse(df$state == 1, "encamped", "exploratory")
+
+p2 <- ggplot(df, aes(tod, value, group = state, col = factor(state), fill = factor(state))) +
+  geom_ribbon(aes(ymin = low, ymax = upp), col = NA, alpha = 0.3) +
+  geom_line() +
+  coord_cartesian(ylim = c(0, 1)) +
+  labs(x = "time of day", y = "stationary probability") +
+  scale_color_manual(values = pal_states, name = NULL) +
+  scale_fill_manual(values = pal_states, name = NULL) +
+  scale_x_continuous(breaks = seq(0, 24, by = 4)) +
+  scale_y_continuous(breaks = seq(0, 1, by = 0.5), labels = c("0", "0.5", "1")) +
+  theme(legend.text = element_text(size = 10.5), 
+        legend.position = "bottom")
+
+cowplot::plot_grid(p1, p2, nrow = 1, labels = "auto")
+```
+
+
