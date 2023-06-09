@@ -1,9 +1,11 @@
 # HMM-SSF
-Fit state-switching step selection functions to animal movement data
 
-Natasha Klappstein
+This is now available as an R package at the following link: [hmmSSF](https://github.com/NJKlappstein/hmmSSF)
 
-Working directory note: All scripts were written with the root directory of the repository as the working directory. Sourcing the necessary files must be done from this directory. 
+Install the package using:
+``` R
+devtools::install_github("NJKlappstein/hmmSSF")
+```
 
 This repository contains the code to reproduce the illustrative example of Klappstein et al. ([https://doi.org/10.1101/2022.11.30.518554](https://doi.org/10.1101/2022.11.30.518554)). The habitat raster and zebra tracking data were provided by Simon Chamaillé-Jammes. This README describes 3 folders (`code`, `data`, and `documents`). Note, this repo is a work-in-progress and will be updated periodically.
 
